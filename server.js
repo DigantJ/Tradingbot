@@ -102,23 +102,20 @@ function getStrikeStep(symbol) {
   return 100;
 }
 
-// ── DOWNLOAD INSTRUMENT LIST ──────────────────────────────────
-// Angel One provides a full instrument dump — we use this to find
-// the correct tokens for each option contract
-let instruments = null;
+// ── INSTRUMENT LIST ───────────────────────────────────────────
+let instruments     = null;
 let instrumentsTime = 0;
 
 async function getInstruments() {
   const now = Date.now();
-  if (instruments && now - instrumentsTime < 3600000) return instruments; // cache 1 hour
-
+  if (instruments && now - instrumentsTime < 3600000) return instruments;
   try {
-    console.log('Downloading instrument list from Angel One...');
+    console.log('Downloading instrument list...');
     const res = await axios.get(
       'https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json',
       { timeout: 30000 }
     );
-    instruments = res.data;
+    instruments     = res.data;
     instrumentsTime = now;
     console.log(`Loaded ${instruments.length} instruments`);
     return instruments;
@@ -128,22 +125,52 @@ async function getInstruments() {
   }
 }
 
-// Find token for a specific option contract
-function findToken(instruments, symbol, strike, optionType, expiry) {
-  // Filter by symbol and option type
-  const filtered = instruments.filter(i =>
-    i.exch_seg === 'NFO' &&
-    i.name === symbol &&
-    i.instrumenttype === 'OPTIDX' &&
-    i.symbol.includes(optionType) &&
-    parseInt(i.strike) === strike * 100 // Angel One stores strike * 100
+// ── FIND NEAREST EXPIRY TOKEN ─────────────────────────────────
+function findNearestToken(allInstruments, symbol, strike, optionType) {
+  // Angel One stores strike * 100 as a float string e.g. "5770000.000000"
+  const strikeVal = (strike * 100).toFixed(6);
+
+  const matches = allInstruments.filter(i =>
+    i.exch_seg       === 'NFO'     &&
+    i.name           === symbol    &&
+    i.instrumenttype === 'OPTIDX'  &&
+    i.strike         === strikeVal &&
+    i.symbol.endsWith(optionType)
   );
 
-  if (filtered.length === 0) return null;
+  if (matches.length === 0) {
+    // Try with tolerance — sometimes float precision differs
+    const strikeNum = strike * 100;
+    const loose = allInstruments.filter(i =>
+      i.exch_seg       === 'NFO'    &&
+      i.name           === symbol   &&
+      i.instrumenttype === 'OPTIDX' &&
+      Math.abs(parseFloat(i.strike) - strikeNum) < 1 &&
+      i.symbol.endsWith(optionType)
+    );
+    if (loose.length === 0) return null;
+    // Sort by nearest expiry
+    loose.sort((a, b) => new Date(a.expiry) - new Date(b.expiry));
+    return loose[0];
+  }
 
-  // Sort by expiry date — get nearest
-  filtered.sort((a, b) => new Date(a.expiry) - new Date(b.expiry));
-  return filtered[0];
+  // Sort by nearest expiry date
+  matches.sort((a, b) => {
+    const da = parseExpiry(a.expiry);
+    const db = parseExpiry(b.expiry);
+    return da - db;
+  });
+
+  return matches[0];
+}
+
+function parseExpiry(expStr) {
+  // Format: 25JUN2026
+  const months = {JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11};
+  const day   = parseInt(expStr.slice(0, 2));
+  const mon   = months[expStr.slice(2, 5)];
+  const year  = parseInt(expStr.slice(5));
+  return new Date(year, mon, day).getTime();
 }
 
 // ── FETCH OPTIONS CHAIN ───────────────────────────────────────
@@ -172,41 +199,49 @@ async function fetchOptionsChain(symbol) {
     underlying = 54000;
   }
 
-  const step      = getStrikeStep(symbol);
-  const atmStrike = Math.round(underlying / step) * step;
+  const step       = getStrikeStep(symbol);
+  const atmStrike  = Math.round(underlying / step) * step;
+  const strikes    = [-2, -1, 0, 1, 2, 3].map(i => atmStrike + i * step);
 
-  // Step 2 — Load instruments and find option tokens
+  // Step 2 — Load instruments
   const allInstruments = await getInstruments();
-  const strikesToFetch = [-2, -1, 0, 1, 2, 3].map(i => atmStrike + i * step);
+  const tokenMap       = {}; // token -> { strike, type }
+  const nfoTokens      = [];
 
-  const tokenToStrike = {}; // token -> { strike, type }
-  const nfoTokens     = [];
-
-  strikesToFetch.forEach(strike => {
-    const ceInstr = findToken(allInstruments, symbol, strike, 'CE', null);
-    const peInstr = findToken(allInstruments, symbol, strike, 'PE', null);
+  strikes.forEach(strike => {
+    const ceInstr = findNearestToken(allInstruments, symbol, strike, 'CE');
+    const peInstr = findNearestToken(allInstruments, symbol, strike, 'PE');
 
     if (ceInstr) {
       nfoTokens.push(ceInstr.token);
-      tokenToStrike[ceInstr.token] = { strike, type: 'CE' };
-      console.log(`Found CE token for ${symbol} ${strike}: ${ceInstr.token} exp:${ceInstr.expiry}`);
+      tokenMap[ceInstr.token] = { strike, type: 'CE', expiry: ceInstr.expiry };
+      console.log(`CE ${strike}: token=${ceInstr.token} expiry=${ceInstr.expiry}`);
+    } else {
+      console.warn(`No CE token found for ${symbol} ${strike}`);
     }
+
     if (peInstr) {
       nfoTokens.push(peInstr.token);
-      tokenToStrike[peInstr.token] = { strike, type: 'PE' };
-      console.log(`Found PE token for ${symbol} ${strike}: ${peInstr.token} exp:${peInstr.expiry}`);
+      tokenMap[peInstr.token] = { strike, type: 'PE', expiry: peInstr.expiry };
+      console.log(`PE ${strike}: token=${peInstr.token} expiry=${peInstr.expiry}`);
+    } else {
+      console.warn(`No PE token found for ${symbol} ${strike}`);
     }
   });
 
-  // Step 3 — Get quotes for all option tokens
+  // Step 3 — Get live quotes
   const strikeData = {};
-  strikesToFetch.forEach(s => {
-    strikeData[s] = { strike: s, isATM: s === atmStrike, callVol: 0, callOI: 0, callLTP: 0, putVol: 0, putOI: 0, putLTP: 0 };
+  strikes.forEach(s => {
+    strikeData[s] = {
+      strike: s, isATM: s === atmStrike,
+      callVol: 0, callOI: 0, callLTP: 0,
+      putVol:  0, putOI:  0, putLTP:  0,
+    };
   });
 
   if (nfoTokens.length > 0) {
     try {
-      console.log(`Fetching quotes for ${nfoTokens.length} option tokens...`);
+      console.log(`Fetching FULL quotes for ${nfoTokens.length} tokens...`);
       const quoteRes = await axios.post(
         'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
         { mode: 'FULL', exchangeTokens: { NFO: nfoTokens } },
@@ -214,33 +249,41 @@ async function fetchOptionsChain(symbol) {
       );
 
       const fetched = quoteRes.data?.data?.fetched || [];
-      console.log(`Got ${fetched.length} quotes back`);
+      console.log(`Received ${fetched.length} quotes`);
+      if (fetched.length > 0) console.log('Sample quote keys:', Object.keys(fetched[0]));
 
       fetched.forEach(q => {
-        const info = tokenToStrike[q.symbolToken];
+        const info = tokenMap[q.symbolToken] || tokenMap[q.token];
         if (!info) return;
         const sd = strikeData[info.strike];
         if (!sd) return;
 
+        // Angel One uses different field names — check all possibilities
+        const vol = q.tradeVolume || q.tradedVolume || q.volume || q.totTrdVal || q.tottrdvol || 0;
+        const oi  = q.openInterest || q.opnInterest || q.oi || 0;
+        const ltp = q.ltp || q.lastPrice || q.close || 0;
+
         if (info.type === 'CE') {
-          sd.callLTP = q.ltp            || 0;
-          sd.callVol = q.tradeVolume    || q.totTrdVal || q.volume || 0;
-          sd.callOI  = q.openInterest   || q.opnInterest || 0;
+          sd.callVol = vol;
+          sd.callOI  = oi;
+          sd.callLTP = ltp;
         } else {
-          sd.putLTP  = q.ltp            || 0;
-          sd.putVol  = q.tradeVolume    || q.totTrdVal || q.volume || 0;
-          sd.putOI   = q.openInterest   || q.opnInterest || 0;
+          sd.putVol  = vol;
+          sd.putOI   = oi;
+          sd.putLTP  = ltp;
         }
       });
     } catch (err) {
-      console.error('Quote fetch error:', err.message);
+      console.error('Quote error:', err.message, err.response?.data);
     }
-  } else {
-    console.warn('No tokens found — check instrument list or symbol name');
   }
 
-  const strikes = strikesToFetch.map(s => strikeData[s]);
-  const result  = { symbol, underlying, atmStrike, strikes, demo: false, timestamp: now };
+  const result = {
+    symbol, underlying, atmStrike,
+    strikes: strikes.map(s => strikeData[s]),
+    demo: false, timestamp: now,
+  };
+
   cache[symbol] = { data: result, time: now };
   return result;
 }
@@ -267,17 +310,21 @@ app.get('/login', async (req, res) => {
 });
 
 app.get('/instruments', async (req, res) => {
-  const list = await getInstruments();
+  const list   = await getInstruments();
   const symbol = (req.query.symbol || 'BANKNIFTY').toUpperCase();
-  const filtered = list.filter(i => i.name === symbol && i.exch_seg === 'NFO').slice(0, 20);
-  res.json({ count: filtered.length, sample: filtered });
+  const strike = req.query.strike ? parseInt(req.query.strike) : null;
+  let filtered = list.filter(i => i.name === symbol && i.exch_seg === 'NFO');
+  if (strike) {
+    const strikeVal = strike * 100;
+    filtered = filtered.filter(i => Math.abs(parseFloat(i.strike) - strikeVal) < 1);
+  }
+  res.json({ count: filtered.length, sample: filtered.slice(0, 20) });
 });
 
 // ── START ─────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`TradingBot Proxy running on port ${PORT}`);
   await login();
-  // Pre-load instruments on startup
   await getInstruments();
 });
 
