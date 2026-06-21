@@ -9,17 +9,16 @@ const PORT = process.env.PORT || 3000;
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ── CREDENTIALS ──────────────────────────────────────────────
 const API_KEY     = process.env.ANGEL_API_KEY;
 const CLIENT_ID   = process.env.ANGEL_CLIENT_ID;
 const PASSWORD    = process.env.ANGEL_PASSWORD;
 const TOTP_SECRET = process.env.ANGEL_TOTP_SECRET;
 
-// ── TOTP GENERATOR ───────────────────────────────────────────
+// ── TOTP ─────────────────────────────────────────────────────
 function generateTOTP(secret) {
   const base32chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
   let bits = '';
-  for (const char of secret.toUpperCase().replace(/=+$/, '').replace(/\s/g, '')) {
+  for (const char of secret.toUpperCase().replace(/[^A-Z2-7]/g, '')) {
     const val = base32chars.indexOf(char);
     if (val === -1) continue;
     bits += val.toString(2).padStart(5, '0');
@@ -49,14 +48,14 @@ async function login() {
       { clientcode: CLIENT_ID, password: PASSWORD, totp: totpCode },
       {
         headers: {
-          'Content-Type':     'application/json',
-          'Accept':           'application/json',
-          'X-UserType':       'USER',
-          'X-SourceID':       'WEB',
-          'X-ClientLocalIP':  '127.0.0.1',
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'X-UserType': 'USER',
+          'X-SourceID': 'WEB',
+          'X-ClientLocalIP': '127.0.0.1',
           'X-ClientPublicIP': '127.0.0.1',
-          'X-MACAddress':     '00:00:00:00:00:00',
-          'X-PrivateKey':     API_KEY,
+          'X-MACAddress': '00:00:00:00:00:00',
+          'X-PrivateKey': API_KEY,
         }
       }
     );
@@ -81,15 +80,15 @@ async function ensureSession() {
 
 function getHeaders() {
   return {
-    'Authorization':    `Bearer ${session.jwtToken}`,
-    'Content-Type':     'application/json',
-    'Accept':           'application/json',
-    'X-UserType':       'USER',
-    'X-SourceID':       'WEB',
-    'X-ClientLocalIP':  '127.0.0.1',
+    'Authorization': `Bearer ${session.jwtToken}`,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'X-UserType': 'USER',
+    'X-SourceID': 'WEB',
+    'X-ClientLocalIP': '127.0.0.1',
     'X-ClientPublicIP': '127.0.0.1',
-    'X-MACAddress':     '00:00:00:00:00:00',
-    'X-PrivateKey':     API_KEY,
+    'X-MACAddress': '00:00:00:00:00:00',
+    'X-PrivateKey': API_KEY,
   };
 }
 
@@ -103,9 +102,51 @@ function getStrikeStep(symbol) {
   return 100;
 }
 
+// ── DOWNLOAD INSTRUMENT LIST ──────────────────────────────────
+// Angel One provides a full instrument dump — we use this to find
+// the correct tokens for each option contract
+let instruments = null;
+let instrumentsTime = 0;
+
+async function getInstruments() {
+  const now = Date.now();
+  if (instruments && now - instrumentsTime < 3600000) return instruments; // cache 1 hour
+
+  try {
+    console.log('Downloading instrument list from Angel One...');
+    const res = await axios.get(
+      'https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json',
+      { timeout: 30000 }
+    );
+    instruments = res.data;
+    instrumentsTime = now;
+    console.log(`Loaded ${instruments.length} instruments`);
+    return instruments;
+  } catch (err) {
+    console.error('Instrument download error:', err.message);
+    return [];
+  }
+}
+
+// Find token for a specific option contract
+function findToken(instruments, symbol, strike, optionType, expiry) {
+  // Filter by symbol and option type
+  const filtered = instruments.filter(i =>
+    i.exch_seg === 'NFO' &&
+    i.name === symbol &&
+    i.instrumenttype === 'OPTIDX' &&
+    i.symbol.includes(optionType) &&
+    parseInt(i.strike) === strike * 100 // Angel One stores strike * 100
+  );
+
+  if (filtered.length === 0) return null;
+
+  // Sort by expiry date — get nearest
+  filtered.sort((a, b) => new Date(a.expiry) - new Date(b.expiry));
+  return filtered[0];
+}
+
 // ── FETCH OPTIONS CHAIN ───────────────────────────────────────
-// Angel One provides options data via their market data websocket
-// For REST, we use the GttRuleList or search scrip endpoint
 async function fetchOptionsChain(symbol) {
   const now = Date.now();
   if (cache[symbol] && now - cache[symbol].time < CACHE_TTL) return cache[symbol].data;
@@ -113,116 +154,93 @@ async function fetchOptionsChain(symbol) {
   const ok = await ensureSession();
   if (!ok) throw new Error('Authentication failed');
 
-  // Step 1: Get current underlying price via quote
-  const symbolTokenMap = {
-    'BANKNIFTY': { token: '26009', exch: 'NSE' },
-    'NIFTY':     { token: '26000', exch: 'NSE' },
-  };
+  // Step 1 — Get underlying price
+  const indexTokens = { 'BANKNIFTY': '26009', 'NIFTY': '26000', 'SENSEX': '1' };
+  const indexToken  = indexTokens[symbol] || '26009';
+  let underlying    = 0;
 
-  const info = symbolTokenMap[symbol] || { token: '26009', exch: 'NSE' };
-
-  // Get underlying LTP
-  let underlying = 0;
   try {
     const ltpRes = await axios.post(
       'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
-      { mode: 'LTP', exchangeTokens: { [info.exch]: [info.token] } },
+      { mode: 'LTP', exchangeTokens: { NSE: [indexToken] } },
       { headers: getHeaders() }
     );
     underlying = ltpRes.data?.data?.fetched?.[0]?.ltp || 54000;
-    console.log(`Underlying price for ${symbol}: ${underlying}`);
+    console.log(`${symbol} underlying: ${underlying}`);
   } catch (err) {
-    console.error('LTP fetch error:', err.message);
+    console.error('LTP error:', err.message);
     underlying = 54000;
   }
 
   const step      = getStrikeStep(symbol);
   const atmStrike = Math.round(underlying / step) * step;
 
-  // Step 2: Search for option contracts and get their quotes
-  const strikes = [];
-  const optionTokens = { NSE: [], NFO: [] };
-  const strikeMap = {};
+  // Step 2 — Load instruments and find option tokens
+  const allInstruments = await getInstruments();
+  const strikesToFetch = [-2, -1, 0, 1, 2, 3].map(i => atmStrike + i * step);
 
-  // Build list of strikes to fetch — ITM2, ITM1, ATM, OTM1, OTM2, OTM3
-  for (let i = -2; i <= 3; i++) {
-    const strike = atmStrike + i * step;
-    strikes.push({ strike, isATM: i === 0, callVol: 0, callOI: 0, callLTP: 0, putVol: 0, putOI: 0, putLTP: 0 });
-  }
+  const tokenToStrike = {}; // token -> { strike, type }
+  const nfoTokens     = [];
 
-  // Step 3: Try to get option chain via searchScrip
-  try {
-    for (let i = -2; i <= 3; i++) {
-      const strike = atmStrike + i * step;
+  strikesToFetch.forEach(strike => {
+    const ceInstr = findToken(allInstruments, symbol, strike, 'CE', null);
+    const peInstr = findToken(allInstruments, symbol, strike, 'PE', null);
 
-      // Search for CE (Call)
-      const ceSearch = await axios.get(
-        `https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/searchScrip?exchange=NFO&searchscrip=${symbol}${strike}CE`,
-        { headers: getHeaders() }
-      );
-      const ceData = ceSearch.data?.data?.[0];
-
-      // Search for PE (Put)
-      const peSearch = await axios.get(
-        `https://apiconnect.angelbroking.com/rest/secure/angelbroking/order/v1/searchScrip?exchange=NFO&searchscrip=${symbol}${strike}PE`,
-        { headers: getHeaders() }
-      );
-      const peData = peSearch.data?.data?.[0];
-
-      if (ceData) optionTokens.NFO.push(ceData.symboltoken);
-      if (peData) optionTokens.NFO.push(peData.symboltoken);
-
-      strikeMap[`CE_${strike}`] = ceData?.symboltoken;
-      strikeMap[`PE_${strike}`] = peData?.symboltoken;
+    if (ceInstr) {
+      nfoTokens.push(ceInstr.token);
+      tokenToStrike[ceInstr.token] = { strike, type: 'CE' };
+      console.log(`Found CE token for ${symbol} ${strike}: ${ceInstr.token} exp:${ceInstr.expiry}`);
     }
+    if (peInstr) {
+      nfoTokens.push(peInstr.token);
+      tokenToStrike[peInstr.token] = { strike, type: 'PE' };
+      console.log(`Found PE token for ${symbol} ${strike}: ${peInstr.token} exp:${peInstr.expiry}`);
+    }
+  });
 
-    // Get quotes for all option tokens
-    if (optionTokens.NFO.length > 0) {
+  // Step 3 — Get quotes for all option tokens
+  const strikeData = {};
+  strikesToFetch.forEach(s => {
+    strikeData[s] = { strike: s, isATM: s === atmStrike, callVol: 0, callOI: 0, callLTP: 0, putVol: 0, putOI: 0, putLTP: 0 };
+  });
+
+  if (nfoTokens.length > 0) {
+    try {
+      console.log(`Fetching quotes for ${nfoTokens.length} option tokens...`);
       const quoteRes = await axios.post(
         'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
-        { mode: 'FULL', exchangeTokens: { NFO: optionTokens.NFO } },
+        { mode: 'FULL', exchangeTokens: { NFO: nfoTokens } },
         { headers: getHeaders() }
       );
 
       const fetched = quoteRes.data?.data?.fetched || [];
+      console.log(`Got ${fetched.length} quotes back`);
 
-      // Map quote data back to strikes
-      strikes.forEach(s => {
-        const ceToken = strikeMap[`CE_${s.strike}`];
-        const peToken = strikeMap[`PE_${s.strike}`];
+      fetched.forEach(q => {
+        const info = tokenToStrike[q.symbolToken];
+        if (!info) return;
+        const sd = strikeData[info.strike];
+        if (!sd) return;
 
-        const ceQuote = fetched.find(f => f.symbolToken === ceToken);
-        const peQuote = fetched.find(f => f.symbolToken === peToken);
-
-        if (ceQuote) {
-          s.callLTP = ceQuote.ltp      || 0;
-          s.callVol = ceQuote.tradeVol || ceQuote.totTrdVal || 0;
-          s.callOI  = ceQuote.opnInterest || 0;
-        }
-        if (peQuote) {
-          s.putLTP  = peQuote.ltp      || 0;
-          s.putVol  = peQuote.tradeVol || peQuote.totTrdVal || 0;
-          s.putOI   = peQuote.opnInterest || 0;
+        if (info.type === 'CE') {
+          sd.callLTP = q.ltp            || 0;
+          sd.callVol = q.tradeVolume    || q.totTrdVal || q.volume || 0;
+          sd.callOI  = q.openInterest   || q.opnInterest || 0;
+        } else {
+          sd.putLTP  = q.ltp            || 0;
+          sd.putVol  = q.tradeVolume    || q.totTrdVal || q.volume || 0;
+          sd.putOI   = q.openInterest   || q.opnInterest || 0;
         }
       });
+    } catch (err) {
+      console.error('Quote fetch error:', err.message);
     }
-  } catch (err) {
-    console.error('Options fetch error:', err.message);
-    // If API fails, generate realistic demo data
-    strikes.forEach((s, i) => {
-      const dist = Math.abs(i - 2);
-      const base = Math.floor(Math.random() * 5000000 + 1000000);
-      const factor = Math.exp(-dist * 0.4);
-      s.callVol = Math.floor(base * factor);
-      s.putVol  = Math.floor(base * factor * (Math.random() + 0.5));
-      s.callLTP = Math.max(5, Math.floor((300 - dist * 80) + Math.random() * 20));
-      s.putLTP  = Math.max(5, Math.floor((300 - dist * 80) + Math.random() * 20));
-      s.callOI  = Math.floor(base * factor * 3);
-      s.putOI   = Math.floor(base * factor * 3);
-    });
+  } else {
+    console.warn('No tokens found — check instrument list or symbol name');
   }
 
-  const result = { symbol, underlying, atmStrike, strikes, demo: false, timestamp: now };
+  const strikes = strikesToFetch.map(s => strikeData[s]);
+  const result  = { symbol, underlying, atmStrike, strikes, demo: false, timestamp: now };
   cache[symbol] = { data: result, time: now };
   return result;
 }
@@ -248,10 +266,19 @@ app.get('/login', async (req, res) => {
   res.json({ success: ok, time: new Date().toISOString() });
 });
 
+app.get('/instruments', async (req, res) => {
+  const list = await getInstruments();
+  const symbol = (req.query.symbol || 'BANKNIFTY').toUpperCase();
+  const filtered = list.filter(i => i.name === symbol && i.exch_seg === 'NFO').slice(0, 20);
+  res.json({ count: filtered.length, sample: filtered });
+});
+
 // ── START ─────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`TradingBot Proxy running on port ${PORT}`);
   await login();
+  // Pre-load instruments on startup
+  await getInstruments();
 });
 
 setInterval(async () => {
