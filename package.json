@@ -1,7 +1,7 @@
 {
   "name": "tradingbot-proxy",
-  "version": "1.0.0",
-  "description": "NSE options data proxy for TradingBot Pro",
+  "version": "2.0.0",
+  "description": "Angel One SmartAPI proxy for TradingBot Pro",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
