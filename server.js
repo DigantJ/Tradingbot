@@ -96,6 +96,12 @@ function getHeaders() {
 const cache = {};
 const CACHE_TTL = 10000;
 
+function getStrikeStep(symbol) {
+  if (symbol.includes('BANKNIFTY')) return 100;
+  if (symbol.includes('NIFTY'))     return 50;
+  return 100;
+}
+
 // ── INSTRUMENT LIST ───────────────────────────────────────────
 let instruments     = null;
 let instrumentsTime = 0;
@@ -119,65 +125,24 @@ async function getInstruments() {
   }
 }
 
-// ── DETECT REAL STRIKE STEP FOR ANY SYMBOL ────────────────────
-// Instead of guessing, find actual consecutive strikes that exist
-// for this symbol/expiry in the instrument data, and compute the gap
-function detectStrikeStep(allInstruments, symbol) {
-  const opts = allInstruments.filter(i =>
-    i.exch_seg === 'NFO' &&
-    i.name === symbol &&
-    (i.instrumenttype === 'OPTIDX' || i.instrumenttype === 'OPTSTK') &&
-    i.symbol.endsWith('CE')
-  );
-
-  if (opts.length < 2) return symbol.includes('BANKNIFTY') ? 100 : symbol.includes('NIFTY') ? 50 : 10;
-
-  // Get nearest expiry's strikes
-  opts.sort((a, b) => parseExpiry(a.expiry) - parseExpiry(b.expiry));
-  const nearestExpiry = opts[0].expiry;
-  const strikesForExpiry = opts
-    .filter(o => o.expiry === nearestExpiry)
-    .map(o => parseFloat(o.strike) / 100)
-    .sort((a, b) => a - b);
-
-  if (strikesForExpiry.length < 2) return 10;
-
-  // Find the smallest consistent gap between consecutive strikes
-  const gaps = [];
-  for (let i = 1; i < strikesForExpiry.length; i++) {
-    gaps.push(strikesForExpiry[i] - strikesForExpiry[i - 1]);
-  }
-  // Most common gap = the real strike step
-  const gapCounts = {};
-  gaps.forEach(g => { gapCounts[g] = (gapCounts[g] || 0) + 1; });
-  const mostCommonGap = Object.keys(gapCounts).reduce((a, b) => gapCounts[a] > gapCounts[b] ? a : b);
-
-  return parseFloat(mostCommonGap) || 10;
-}
-
-function parseExpiry(expStr) {
-  const months = {JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11};
-  const day  = parseInt(expStr.slice(0, 2));
-  const mon  = months[expStr.slice(2, 5)];
-  const year = parseInt(expStr.slice(5));
-  return new Date(year, mon, day).getTime();
-}
-
+// ── FIND NEAREST EXPIRY TOKEN ─────────────────────────────────
 function findNearestToken(allInstruments, symbol, strike, optionType) {
   const strikeVal = (strike * 100).toFixed(6);
+
   const matches = allInstruments.filter(i =>
-    i.exch_seg === 'NFO' &&
-    i.name === symbol &&
-    (i.instrumenttype === 'OPTIDX' || i.instrumenttype === 'OPTSTK') &&
-    i.strike === strikeVal &&
+    i.exch_seg       === 'NFO'     &&
+    i.name           === symbol    &&
+    i.instrumenttype === 'OPTIDX'  &&
+    i.strike         === strikeVal &&
     i.symbol.endsWith(optionType)
   );
+
   if (matches.length === 0) {
     const strikeNum = strike * 100;
     const loose = allInstruments.filter(i =>
-      i.exch_seg === 'NFO' &&
-      i.name === symbol &&
-      (i.instrumenttype === 'OPTIDX' || i.instrumenttype === 'OPTSTK') &&
+      i.exch_seg       === 'NFO'    &&
+      i.name           === symbol   &&
+      i.instrumenttype === 'OPTIDX' &&
       Math.abs(parseFloat(i.strike) - strikeNum) < 1 &&
       i.symbol.endsWith(optionType)
     );
@@ -185,42 +150,20 @@ function findNearestToken(allInstruments, symbol, strike, optionType) {
     loose.sort((a, b) => parseExpiry(a.expiry) - parseExpiry(b.expiry));
     return loose[0];
   }
+
   matches.sort((a, b) => parseExpiry(a.expiry) - parseExpiry(b.expiry));
   return matches[0];
 }
 
-// ── GET STOCK LTP (for individual stocks, not just indices) ───
-async function getStockLTP(symbol, allInstruments) {
-  // Try index map first
-  const indexTokens = { 'BANKNIFTY': '26009', 'NIFTY': '26000', 'SENSEX': '1' };
-  if (indexTokens[symbol]) {
-    const res = await axios.post(
-      'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
-      { mode: 'LTP', exchangeTokens: { NSE: [indexTokens[symbol]] } },
-      { headers: getHeaders() }
-    );
-    return res.data?.data?.fetched?.[0]?.ltp || 0;
-  }
-
-  // For individual stocks — find the EQ instrument
-  const eqInstr = allInstruments.find(i =>
-    i.exch_seg === 'NSE' &&
-    i.symbol === `${symbol}-EQ`
-  );
-  if (!eqInstr) {
-    console.warn(`No EQ instrument found for ${symbol}`);
-    return 0;
-  }
-
-  const res = await axios.post(
-    'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
-    { mode: 'LTP', exchangeTokens: { NSE: [eqInstr.token] } },
-    { headers: getHeaders() }
-  );
-  return res.data?.data?.fetched?.[0]?.ltp || 0;
+function parseExpiry(expStr) {
+  const months = {JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11};
+  const day   = parseInt(expStr.slice(0, 2));
+  const mon   = months[expStr.slice(2, 5)];
+  const year  = parseInt(expStr.slice(5));
+  return new Date(year, mon, day).getTime();
 }
 
-// ── FETCH OPTIONS CHAIN — works for index AND stocks ──────────
+// ── FETCH OPTIONS CHAIN ───────────────────────────────────────
 async function fetchOptionsChain(symbol) {
   const now = Date.now();
   if (cache[symbol] && now - cache[symbol].time < CACHE_TTL) return cache[symbol].data;
@@ -228,68 +171,103 @@ async function fetchOptionsChain(symbol) {
   const ok = await ensureSession();
   if (!ok) throw new Error('Authentication failed');
 
-  const allInstruments = await getInstruments();
+  // Step 1 — Get underlying price
+  const indexTokens = { 'BANKNIFTY': '26009', 'NIFTY': '26000', 'SENSEX': '1' };
+  const indexToken  = indexTokens[symbol] || '26009';
+  let underlying    = 0;
 
-  // Get underlying price (works for index or stock)
-  let underlying = 0;
   try {
-    underlying = await getStockLTP(symbol, allInstruments);
+    const ltpRes = await axios.post(
+      'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
+      { mode: 'LTP', exchangeTokens: { NSE: [indexToken] } },
+      { headers: getHeaders() }
+    );
+    underlying = ltpRes.data?.data?.fetched?.[0]?.ltp || 54000;
     console.log(`${symbol} underlying: ${underlying}`);
   } catch (err) {
     console.error('LTP error:', err.message);
+    underlying = 54000;
   }
-  if (!underlying) underlying = symbol.includes('BANKNIFTY') ? 54000 : symbol.includes('NIFTY') ? 24000 : 1000;
 
-  // Detect correct strike step for THIS symbol specifically
-  const step      = detectStrikeStep(allInstruments, symbol);
+  const step      = getStrikeStep(symbol);
   const atmStrike = Math.round(underlying / step) * step;
-  const strikes   = [-2, -1, 0, 1, 2, 3].map(i => atmStrike + i * step);
 
-  console.log(`${symbol}: step=${step}, ATM=${atmStrike}`);
-
-  const tokenMap  = {};
-  const nfoTokens = [];
+  // Step 2 — Load instruments
+  const allInstruments = await getInstruments();
+  const tokenMap        = {};
+  const nfoTokens        = [];
+  const strikes = [-2, -1, 0, 1, 2, 3].map(i => atmStrike + i * step);
 
   strikes.forEach(strike => {
     const ceInstr = findNearestToken(allInstruments, symbol, strike, 'CE');
     const peInstr = findNearestToken(allInstruments, symbol, strike, 'PE');
-    if (ceInstr) { nfoTokens.push(ceInstr.token); tokenMap[ceInstr.token] = { strike, type: 'CE' }; }
-    if (peInstr) { nfoTokens.push(peInstr.token); tokenMap[peInstr.token] = { strike, type: 'PE' }; }
+
+    if (ceInstr) {
+      nfoTokens.push(ceInstr.token);
+      tokenMap[ceInstr.token] = { strike, type: 'CE', expiry: ceInstr.expiry };
+      console.log(`CE ${strike}: token=${ceInstr.token} expiry=${ceInstr.expiry}`);
+    } else {
+      console.warn(`No CE token found for ${symbol} ${strike}`);
+    }
+
+    if (peInstr) {
+      nfoTokens.push(peInstr.token);
+      tokenMap[peInstr.token] = { strike, type: 'PE', expiry: peInstr.expiry };
+      console.log(`PE ${strike}: token=${peInstr.token} expiry=${peInstr.expiry}`);
+    } else {
+      console.warn(`No PE token found for ${symbol} ${strike}`);
+    }
   });
 
+  // Step 3 — Get live quotes
   const strikeData = {};
   strikes.forEach(s => {
-    strikeData[s] = { strike: s, isATM: s === atmStrike, callVol: 0, callOI: 0, callLTP: 0, putVol: 0, putOI: 0, putLTP: 0 };
+    strikeData[s] = {
+      strike: s, isATM: s === atmStrike,
+      callVol: 0, callOI: 0, callLTP: 0,
+      putVol:  0, putOI:  0, putLTP:  0,
+    };
   });
 
   if (nfoTokens.length > 0) {
     try {
+      console.log(`Fetching FULL quotes for ${nfoTokens.length} tokens...`);
       const quoteRes = await axios.post(
         'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
         { mode: 'FULL', exchangeTokens: { NFO: nfoTokens } },
         { headers: getHeaders() }
       );
+
       const fetched = quoteRes.data?.data?.fetched || [];
+      console.log(`Received ${fetched.length} quotes`);
+
       fetched.forEach(q => {
-        const info = tokenMap[q.symbolToken];
+        const info = tokenMap[q.symbolToken] || tokenMap[q.token];
         if (!info) return;
         const sd = strikeData[info.strike];
         if (!sd) return;
-        const vol = q.tradeVolume || q.tradedVolume || q.volume || q.totTrdVal || 0;
-        const oi  = q.openInterest || q.opnInterest || 0;
-        const ltp = q.ltp || q.lastPrice || 0;
-        if (info.type === 'CE') { sd.callVol = vol; sd.callOI = oi; sd.callLTP = ltp; }
-        else                     { sd.putVol  = vol; sd.putOI  = oi; sd.putLTP  = ltp; }
+
+        const vol = q.tradeVolume || q.tradedVolume || q.volume || q.totTrdVal || q.tottrdvol || 0;
+        const oi  = q.openInterest || q.opnInterest || q.oi || 0;
+        const ltp = q.ltp || q.lastPrice || q.close || 0;
+
+        if (info.type === 'CE') {
+          sd.callVol = vol;
+          sd.callOI  = oi;
+          sd.callLTP = ltp;
+        } else {
+          sd.putVol  = vol;
+          sd.putOI   = oi;
+          sd.putLTP  = ltp;
+        }
       });
     } catch (err) {
-      console.error('Quote error:', err.message);
+      console.error('Quote error:', err.message, err.response?.data);
     }
-  } else {
-    console.warn(`No option tokens found for ${symbol} — may not have F&O contracts`);
   }
 
   const result = {
-    symbol, underlying, atmStrike, strikeStep: step,
+    symbol, underlying, atmStrike,
     strikes: strikes.map(s => strikeData[s]),
     demo: false, timestamp: now,
   };
@@ -319,18 +297,26 @@ app.get('/login', async (req, res) => {
   res.json({ success: ok, time: new Date().toISOString() });
 });
 
-app.get('/strikestep', async (req, res) => {
+app.get('/instruments', async (req, res) => {
+  const list   = await getInstruments();
   const symbol = (req.query.symbol || 'BANKNIFTY').toUpperCase();
-  const list = await getInstruments();
-  const step = detectStrikeStep(list, symbol);
-  res.json({ symbol, strikeStep: step });
+  const strike = req.query.strike ? parseInt(req.query.strike) : null;
+  let filtered = list.filter(i => i.name === symbol && i.exch_seg === 'NFO');
+  if (strike) {
+    const strikeVal = strike * 100;
+    filtered = filtered.filter(i => Math.abs(parseFloat(i.strike) - strikeVal) < 1);
+  }
+  res.json({ count: filtered.length, sample: filtered.slice(0, 20) });
 });
 
 // ── START ─────────────────────────────────────────────────────
 app.listen(PORT, async () => {
-  console.log(`TradingBot Proxy v2 running on port ${PORT}`);
+  console.log(`TradingBot Proxy running on port ${PORT}`);
   await login();
   await getInstruments();
 });
 
-setInterval(async () => { await login(); }, 55 * 60 * 1000);
+setInterval(async () => {
+  console.log('Refreshing session...');
+  await login();
+}, 55 * 60 * 1000);
