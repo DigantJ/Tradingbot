@@ -125,42 +125,67 @@ async function getInstruments() {
   }
 }
 
-// ── FIND NEAREST EXPIRY TOKEN ─────────────────────────────────
-function findNearestToken(allInstruments, symbol, strike, optionType) {
-  const strikeVal = (strike * 100).toFixed(6);
-
-  const matches = allInstruments.filter(i =>
-    i.exch_seg       === 'NFO'     &&
-    i.name           === symbol    &&
-    i.instrumenttype === 'OPTIDX'  &&
-    i.strike         === strikeVal &&
-    i.symbol.endsWith(optionType)
-  );
-
-  if (matches.length === 0) {
-    const strikeNum = strike * 100;
-    const loose = allInstruments.filter(i =>
-      i.exch_seg       === 'NFO'    &&
-      i.name           === symbol   &&
-      i.instrumenttype === 'OPTIDX' &&
-      Math.abs(parseFloat(i.strike) - strikeNum) < 1 &&
-      i.symbol.endsWith(optionType)
-    );
-    if (loose.length === 0) return null;
-    loose.sort((a, b) => parseExpiry(a.expiry) - parseExpiry(b.expiry));
-    return loose[0];
-  }
-
-  matches.sort((a, b) => parseExpiry(a.expiry) - parseExpiry(b.expiry));
-  return matches[0];
-}
-
 function parseExpiry(expStr) {
   const months = {JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11};
   const day   = parseInt(expStr.slice(0, 2));
   const mon   = months[expStr.slice(2, 5)];
   const year  = parseInt(expStr.slice(5));
   return new Date(year, mon, day).getTime();
+}
+
+// ── GET NEAREST EXPIRY FOR SYMBOL ─────────────────────────────
+function getNearestExpiry(allInstruments, symbol) {
+  const now = Date.now();
+  const expiries = [...new Set(
+    allInstruments
+      .filter(i => i.exch_seg === 'NFO' && i.name === symbol && i.instrumenttype === 'OPTIDX')
+      .map(i => i.expiry)
+  )].filter(e => parseExpiry(e) >= now);
+  expiries.sort((a, b) => parseExpiry(a) - parseExpiry(b));
+  return expiries[0] || null;
+}
+
+// ── GET ALL STRIKES FOR EXPIRY ────────────────────────────────
+// Returns full options chain for a given symbol and expiry
+function getAllStrikeTokens(allInstruments, symbol, expiry) {
+  const opts = allInstruments.filter(i =>
+    i.exch_seg       === 'NFO'   &&
+    i.name           === symbol  &&
+    i.instrumenttype === 'OPTIDX' &&
+    i.expiry         === expiry
+  );
+
+  const strikeMap = {};
+  opts.forEach(i => {
+    const strike = Math.round(parseFloat(i.strike) / 100);
+    if (!strikeMap[strike]) strikeMap[strike] = { strike, ceToken: null, peToken: null };
+    if (i.symbol.endsWith('CE')) strikeMap[strike].ceToken = i.token;
+    if (i.symbol.endsWith('PE')) strikeMap[strike].peToken = i.token;
+  });
+
+  return Object.values(strikeMap).sort((a, b) => a.strike - b.strike);
+}
+
+// ── MAX PAIN CALCULATION ──────────────────────────────────────
+// Uses full chain OI — much more accurate than 6-strike version
+function calcMaxPain(fullChain) {
+  if (!fullChain || fullChain.length === 0) return 0;
+  let minPain = Infinity;
+  let maxPainStrike = 0;
+
+  fullChain.forEach(candidate => {
+    let totalPain = 0;
+    fullChain.forEach(s => {
+      totalPain += (s.callOI || 0) * Math.max(0, candidate.strike - s.strike);
+      totalPain += (s.putOI  || 0) * Math.max(0, s.strike - candidate.strike);
+    });
+    if (totalPain < minPain) {
+      minPain = totalPain;
+      maxPainStrike = candidate.strike;
+    }
+  });
+
+  return maxPainStrike;
 }
 
 // ── FETCH OPTIONS CHAIN ───────────────────────────────────────
@@ -192,36 +217,71 @@ async function fetchOptionsChain(symbol) {
   const step      = getStrikeStep(symbol);
   const atmStrike = Math.round(underlying / step) * step;
 
-  // Step 2 — Load instruments
+  // Step 2 — Get nearest expiry + ALL strikes for that expiry
   const allInstruments = await getInstruments();
-  const tokenMap        = {};
-  const nfoTokens        = [];
-  const strikes = [-2, -1, 0, 1, 2, 3].map(i => atmStrike + i * step);
+  const nearestExpiry  = getNearestExpiry(allInstruments, symbol);
+  console.log(`${symbol} nearest expiry: ${nearestExpiry}`);
 
-  strikes.forEach(strike => {
-    const ceInstr = findNearestToken(allInstruments, symbol, strike, 'CE');
-    const peInstr = findNearestToken(allInstruments, symbol, strike, 'PE');
+  const allStrikeTokens = getAllStrikeTokens(allInstruments, symbol, nearestExpiry);
+  console.log(`${symbol} total strikes for max pain: ${allStrikeTokens.length}`);
 
-    if (ceInstr) {
-      nfoTokens.push(ceInstr.token);
-      tokenMap[ceInstr.token] = { strike, type: 'CE', expiry: ceInstr.expiry };
-      console.log(`CE ${strike}: token=${ceInstr.token} expiry=${ceInstr.expiry}`);
-    } else {
-      console.warn(`No CE token found for ${symbol} ${strike}`);
-    }
+  // Step 3 — Fetch OI for ALL strikes (for accurate max pain)
+  // Also fetch full quotes for the 6 display strikes
+  const displayStrikes = [-2, -1, 0, 1, 2, 3].map(i => atmStrike + i * step);
+  const displayTokenMap = {};
+  const displayNFOTokens = [];
 
-    if (peInstr) {
-      nfoTokens.push(peInstr.token);
-      tokenMap[peInstr.token] = { strike, type: 'PE', expiry: peInstr.expiry };
-      console.log(`PE ${strike}: token=${peInstr.token} expiry=${peInstr.expiry}`);
-    } else {
-      console.warn(`No PE token found for ${symbol} ${strike}`);
+  displayStrikes.forEach(strike => {
+    const found = allStrikeTokens.find(s => s.strike === strike);
+    if (found) {
+      if (found.ceToken) { displayNFOTokens.push(found.ceToken); displayTokenMap[found.ceToken] = { strike, type: 'CE' }; }
+      if (found.peToken) { displayNFOTokens.push(found.peToken); displayTokenMap[found.peToken] = { strike, type: 'PE' }; }
     }
   });
 
-  // Step 3 — Get live quotes
+  // For max pain — get OI for ALL strikes (batch in groups of 50)
+  const allTokens = [];
+  const allTokenMap = {};
+  allStrikeTokens.forEach(s => {
+    if (s.ceToken) { allTokens.push(s.ceToken); allTokenMap[s.ceToken] = { strike: s.strike, type: 'CE' }; }
+    if (s.peToken) { allTokens.push(s.peToken); allTokenMap[s.peToken] = { strike: s.strike, type: 'PE' }; }
+  });
+
+  // Batch fetch — Angel One allows max 50 tokens per request
+  const fullChainOI = {};
+  const batchSize = 50;
+  for (let i = 0; i < allTokens.length; i += batchSize) {
+    const batch = allTokens.slice(i, i + batchSize);
+    try {
+      const res = await axios.post(
+        'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
+        { mode: 'LTP', exchangeTokens: { NFO: batch } },
+        { headers: getHeaders() }
+      );
+      const fetched = res.data?.data?.fetched || [];
+      fetched.forEach(q => {
+        const info = allTokenMap[q.symbolToken];
+        if (!info) return;
+        if (!fullChainOI[info.strike]) fullChainOI[info.strike] = { strike: info.strike, callOI: 0, putOI: 0 };
+        const oi = q.openInterest || q.opnInterest || 0;
+        if (info.type === 'CE') fullChainOI[info.strike].callOI = oi;
+        else                    fullChainOI[info.strike].putOI  = oi;
+      });
+    } catch (err) {
+      console.error(`Batch OI fetch error (batch ${i}):`, err.message);
+    }
+  }
+
+  const fullChainArray = Object.values(fullChainOI);
+  console.log(`Got OI for ${fullChainArray.length} strikes`);
+
+  // Calculate Max Pain from full chain
+  const maxPain = calcMaxPain(fullChainArray);
+  console.log(`${symbol} Max Pain: ${maxPain}`);
+
+  // Step 4 — Get FULL quotes for the 6 display strikes
   const strikeData = {};
-  strikes.forEach(s => {
+  displayStrikes.forEach(s => {
     strikeData[s] = {
       strike: s, isATM: s === atmStrike,
       callVol: 0, callOI: 0, callLTP: 0,
@@ -229,46 +289,35 @@ async function fetchOptionsChain(symbol) {
     };
   });
 
-  if (nfoTokens.length > 0) {
+  if (displayNFOTokens.length > 0) {
     try {
-      console.log(`Fetching FULL quotes for ${nfoTokens.length} tokens...`);
       const quoteRes = await axios.post(
         'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
-        { mode: 'FULL', exchangeTokens: { NFO: nfoTokens } },
+        { mode: 'FULL', exchangeTokens: { NFO: displayNFOTokens } },
         { headers: getHeaders() }
       );
-
       const fetched = quoteRes.data?.data?.fetched || [];
-      console.log(`Received ${fetched.length} quotes`);
-
       fetched.forEach(q => {
-        const info = tokenMap[q.symbolToken] || tokenMap[q.token];
+        const info = displayTokenMap[q.symbolToken] || displayTokenMap[q.token];
         if (!info) return;
         const sd = strikeData[info.strike];
         if (!sd) return;
-
         const vol = q.tradeVolume || q.tradedVolume || q.volume || q.totTrdVal || q.tottrdvol || 0;
         const oi  = q.openInterest || q.opnInterest || q.oi || 0;
         const ltp = q.ltp || q.lastPrice || q.close || 0;
-
-        if (info.type === 'CE') {
-          sd.callVol = vol;
-          sd.callOI  = oi;
-          sd.callLTP = ltp;
-        } else {
-          sd.putVol  = vol;
-          sd.putOI   = oi;
-          sd.putLTP  = ltp;
-        }
+        if (info.type === 'CE') { sd.callVol = vol; sd.callOI = oi; sd.callLTP = ltp; }
+        else                     { sd.putVol  = vol; sd.putOI  = oi; sd.putLTP  = ltp; }
       });
     } catch (err) {
-      console.error('Quote error:', err.message, err.response?.data);
+      console.error('Display quote error:', err.message);
     }
   }
 
   const result = {
-    symbol, underlying, atmStrike,
-    strikes: strikes.map(s => strikeData[s]),
+    symbol, underlying, atmStrike, maxPain,
+    expiry: nearestExpiry,
+    totalStrikesUsed: fullChainArray.length,
+    strikes: displayStrikes.map(s => strikeData[s]),
     demo: false, timestamp: now,
   };
 
@@ -311,7 +360,7 @@ app.get('/instruments', async (req, res) => {
 
 // ── START ─────────────────────────────────────────────────────
 app.listen(PORT, async () => {
-  console.log(`TradingBot Proxy running on port ${PORT}`);
+  console.log(`TradingBot Proxy v2 running on port ${PORT}`);
   await login();
   await getInstruments();
 });
