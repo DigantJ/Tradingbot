@@ -14,6 +14,27 @@ const CLIENT_ID   = process.env.ANGEL_CLIENT_ID;
 const PASSWORD    = process.env.ANGEL_PASSWORD;
 const TOTP_SECRET = process.env.ANGEL_TOTP_SECRET;
 
+// ── SYMBOL CONFIG ────────────────────────────────────────────
+// Scope narrowed to NIFTY + SENSEX only (BankNifty dropped per client).
+// BUG FIX (root cause of "CE/PE doesn't match Kite" for SENSEX): Sensex
+// is a BSE instrument, not NSE. Its options trade on BFO (BSE F&O), not
+// NFO. The old code hardcoded 'NFO' and 'NSE' for every symbol, so for
+// SENSEX it was fetching the underlying price from the wrong exchange
+// (with a placeholder token, '1') and searching for option contracts on
+// the wrong segment entirely. That wrong underlying price throws off the
+// ATM-strike calculation, which then centers the whole displayed chain
+// on the wrong strikes — that mismatch is what looked like "CE/PE prices
+// don't match Kite," even though each individual quote call was live.
+const SYMBOL_CONFIG = {
+  NIFTY:  { optionExch: 'NFO', indexExch: 'NSE', strikeStep: 50,  fallbackIndexToken: '26000' },
+  SENSEX: { optionExch: 'BFO', indexExch: 'BSE', strikeStep: 100, fallbackIndexToken: null },
+};
+const ALLOWED_SYMBOLS = Object.keys(SYMBOL_CONFIG);
+
+function getSymbolConfig(symbol) {
+  return SYMBOL_CONFIG[symbol] || SYMBOL_CONFIG.NIFTY;
+}
+
 // ── TOTP ─────────────────────────────────────────────────────
 function generateTOTP(secret) {
   const base32chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
@@ -96,12 +117,6 @@ function getHeaders() {
 const cache = {};
 const CACHE_TTL = 10000;
 
-function getStrikeStep(symbol) {
-  if (symbol.includes('BANKNIFTY')) return 100;
-  if (symbol.includes('NIFTY'))     return 50;
-  return 100;
-}
-
 // ── INSTRUMENT LIST ───────────────────────────────────────────
 let instruments     = null;
 let instrumentsTime = 0;
@@ -133,12 +148,31 @@ function parseExpiry(expStr) {
   return new Date(year, mon, day).getTime();
 }
 
+// BUG FIX: resolve the spot index token from the instrument master itself
+// instead of trusting a hardcoded number. A wrong hardcoded token (like
+// SENSEX's old '1') fails silently — it just returns whatever that token
+// happens to be, with no error. Looking it up by exchange + name means a
+// bad guess is no longer possible; the hardcoded values in SYMBOL_CONFIG
+// are now only a last-resort fallback if the lookup can't find anything.
+function getIndexToken(allInstruments, symbol, cfg) {
+  const candidates = allInstruments.filter(i =>
+    i.exch_seg === cfg.indexExch &&
+    (i.symbol === symbol || i.name === symbol || i.symbol === symbol + '-EQ')
+  );
+  // Prefer an entry with no options-specific fields (the spot index line),
+  // not a derivative contract that happens to share the name.
+  const spot = candidates.find(i => !i.expiry && !i.strike) || candidates[0];
+  if (spot) return spot.token;
+  console.error(`Could not resolve index token for ${symbol} on ${cfg.indexExch} — falling back`);
+  return cfg.fallbackIndexToken;
+}
+
 // ── GET NEAREST EXPIRY FOR SYMBOL ─────────────────────────────
-function getNearestExpiry(allInstruments, symbol) {
+function getNearestExpiry(allInstruments, symbol, cfg) {
   const now = Date.now();
   const expiries = [...new Set(
     allInstruments
-      .filter(i => i.exch_seg === 'NFO' && i.name === symbol && i.instrumenttype === 'OPTIDX')
+      .filter(i => i.exch_seg === cfg.optionExch && i.name === symbol && i.instrumenttype === 'OPTIDX')
       .map(i => i.expiry)
   )].filter(e => parseExpiry(e) >= now);
   expiries.sort((a, b) => parseExpiry(a) - parseExpiry(b));
@@ -147,9 +181,9 @@ function getNearestExpiry(allInstruments, symbol) {
 
 // ── GET ALL STRIKES FOR EXPIRY ────────────────────────────────
 // Returns full options chain for a given symbol and expiry
-function getAllStrikeTokens(allInstruments, symbol, expiry) {
+function getAllStrikeTokens(allInstruments, symbol, expiry, cfg) {
   const opts = allInstruments.filter(i =>
-    i.exch_seg       === 'NFO'   &&
+    i.exch_seg       === cfg.optionExch &&
     i.name           === symbol  &&
     i.instrumenttype === 'OPTIDX' &&
     i.expiry         === expiry
@@ -196,33 +230,42 @@ async function fetchOptionsChain(symbol) {
   const ok = await ensureSession();
   if (!ok) throw new Error('Authentication failed');
 
-  // Step 1 — Get underlying price
-  const indexTokens = { 'BANKNIFTY': '26009', 'NIFTY': '26000', 'SENSEX': '1' };
-  const indexToken  = indexTokens[symbol] || '26009';
+  const cfg  = getSymbolConfig(symbol);
+  const allInstruments = await getInstruments();
+
+  // Step 1 — Get underlying price (correct exchange + resolved token)
+  const indexToken = getIndexToken(allInstruments, symbol, cfg);
   let underlying    = 0;
+  let underlyingOk   = false;
 
-  try {
-    const ltpRes = await axios.post(
-      'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
-      { mode: 'LTP', exchangeTokens: { NSE: [indexToken] } },
-      { headers: getHeaders() }
-    );
-    underlying = ltpRes.data?.data?.fetched?.[0]?.ltp || 54000;
-    console.log(`${symbol} underlying: ${underlying}`);
-  } catch (err) {
-    console.error('LTP error:', err.message);
-    underlying = 54000;
+  if (indexToken) {
+    try {
+      const ltpRes = await axios.post(
+        'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
+        { mode: 'LTP', exchangeTokens: { [cfg.indexExch]: [indexToken] } },
+        { headers: getHeaders() }
+      );
+      const ltp = ltpRes.data?.data?.fetched?.[0]?.ltp;
+      if (ltp && ltp > 0) { underlying = ltp; underlyingOk = true; }
+      console.log(`${symbol} underlying (${cfg.indexExch}:${indexToken}): ${underlying}`);
+    } catch (err) {
+      console.error('LTP error:', err.message);
+    }
   }
+  // BUG FIX: no more silent hardcoded fallback (old code used 54000 for
+  // every symbol, which isn't even close to NIFTY's or SENSEX's scale).
+  // If the underlying can't be fetched, fail loudly instead of quietly
+  // returning a chain built around a nonsense strike.
+  if (!underlyingOk) throw new Error(`Could not fetch live underlying price for ${symbol}`);
 
-  const step      = getStrikeStep(symbol);
+  const step      = cfg.strikeStep;
   const atmStrike = Math.round(underlying / step) * step;
 
   // Step 2 — Get nearest expiry + ALL strikes for that expiry
-  const allInstruments = await getInstruments();
-  const nearestExpiry  = getNearestExpiry(allInstruments, symbol);
+  const nearestExpiry  = getNearestExpiry(allInstruments, symbol, cfg);
   console.log(`${symbol} nearest expiry: ${nearestExpiry}`);
 
-  const allStrikeTokens = getAllStrikeTokens(allInstruments, symbol, nearestExpiry);
+  const allStrikeTokens = getAllStrikeTokens(allInstruments, symbol, nearestExpiry, cfg);
   console.log(`${symbol} total strikes for max pain: ${allStrikeTokens.length}`);
 
   // Step 3 — Fetch OI for ALL strikes (for accurate max pain)
@@ -247,7 +290,10 @@ async function fetchOptionsChain(symbol) {
     if (s.peToken) { allTokens.push(s.peToken); allTokenMap[s.peToken] = { strike: s.strike, type: 'PE' }; }
   });
 
-  // Batch fetch — Angel One allows max 50 tokens per request
+  // BUG FIX: Angel One's 'LTP' quote mode does NOT return openInterest —
+  // only 'FULL' (or 'OHLC') does. The old code requested 'LTP' here and
+  // then read q.openInterest anyway, so oi was always 0 and Max Pain was
+  // being computed off an empty chain the whole time. Switched to 'FULL'.
   const fullChainOI = {};
   const batchSize = 50;
   for (let i = 0; i < allTokens.length; i += batchSize) {
@@ -255,7 +301,7 @@ async function fetchOptionsChain(symbol) {
     try {
       const res = await axios.post(
         'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
-        { mode: 'LTP', exchangeTokens: { NFO: batch } },
+        { mode: 'FULL', exchangeTokens: { [cfg.optionExch]: batch } },
         { headers: getHeaders() }
       );
       const fetched = res.data?.data?.fetched || [];
@@ -293,7 +339,7 @@ async function fetchOptionsChain(symbol) {
     try {
       const quoteRes = await axios.post(
         'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
-        { mode: 'FULL', exchangeTokens: { NFO: displayNFOTokens } },
+        { mode: 'FULL', exchangeTokens: { [cfg.optionExch]: displayNFOTokens } },
         { headers: getHeaders() }
       );
       const fetched = quoteRes.data?.data?.fetched || [];
@@ -331,7 +377,8 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/options', async (req, res) => {
-  const symbol = (req.query.symbol || 'BANKNIFTY').toUpperCase();
+  let symbol = (req.query.symbol || 'NIFTY').toUpperCase();
+  if (!ALLOWED_SYMBOLS.includes(symbol)) symbol = 'NIFTY'; // scope: NIFTY + SENSEX only
   try {
     const data = await fetchOptionsChain(symbol);
     res.json(data);
@@ -348,9 +395,11 @@ app.get('/login', async (req, res) => {
 
 app.get('/instruments', async (req, res) => {
   const list   = await getInstruments();
-  const symbol = (req.query.symbol || 'BANKNIFTY').toUpperCase();
+  let symbol   = (req.query.symbol || 'NIFTY').toUpperCase();
+  if (!ALLOWED_SYMBOLS.includes(symbol)) symbol = 'NIFTY';
+  const cfg    = getSymbolConfig(symbol);
   const strike = req.query.strike ? parseInt(req.query.strike) : null;
-  let filtered = list.filter(i => i.name === symbol && i.exch_seg === 'NFO');
+  let filtered = list.filter(i => i.name === symbol && i.exch_seg === cfg.optionExch);
   if (strike) {
     const strikeVal = strike * 100;
     filtered = filtered.filter(i => Math.abs(parseFloat(i.strike) - strikeVal) < 1);
@@ -360,7 +409,7 @@ app.get('/instruments', async (req, res) => {
 
 // ── START ─────────────────────────────────────────────────────
 app.listen(PORT, async () => {
-  console.log(`TradingBot Proxy v2 running on port ${PORT}`);
+  console.log(`TradingBot Proxy v3 running on port ${PORT}`);
   await login();
   await getInstruments();
 });
