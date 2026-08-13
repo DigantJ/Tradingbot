@@ -15,16 +15,6 @@ const PASSWORD    = process.env.ANGEL_PASSWORD;
 const TOTP_SECRET = process.env.ANGEL_TOTP_SECRET;
 
 // ── SYMBOL CONFIG ────────────────────────────────────────────
-// Scope narrowed to NIFTY + SENSEX only (BankNifty dropped per client).
-// BUG FIX (root cause of "CE/PE doesn't match Kite" for SENSEX): Sensex
-// is a BSE instrument, not NSE. Its options trade on BFO (BSE F&O), not
-// NFO. The old code hardcoded 'NFO' and 'NSE' for every symbol, so for
-// SENSEX it was fetching the underlying price from the wrong exchange
-// (with a placeholder token, '1') and searching for option contracts on
-// the wrong segment entirely. That wrong underlying price throws off the
-// ATM-strike calculation, which then centers the whole displayed chain
-// on the wrong strikes — that mismatch is what looked like "CE/PE prices
-// don't match Kite," even though each individual quote call was live.
 const SYMBOL_CONFIG = {
   NIFTY:  { optionExch: 'NFO', indexExch: 'NSE', strikeStep: 50,  fallbackIndexToken: '26000' },
   SENSEX: { optionExch: 'BFO', indexExch: 'BSE', strikeStep: 100, fallbackIndexToken: null },
@@ -148,39 +138,57 @@ function parseExpiry(expStr) {
   return new Date(year, mon, day).getTime();
 }
 
-// BUG FIX: resolve the spot index token from the instrument master itself
-// instead of trusting a hardcoded number. A wrong hardcoded token (like
-// SENSEX's old '1') fails silently — it just returns whatever that token
-// happens to be, with no error. Looking it up by exchange + name means a
-// bad guess is no longer possible; the hardcoded values in SYMBOL_CONFIG
-// are now only a last-resort fallback if the lookup can't find anything.
 function getIndexToken(allInstruments, symbol, cfg) {
   const candidates = allInstruments.filter(i =>
     i.exch_seg === cfg.indexExch &&
     (i.symbol === symbol || i.name === symbol || i.symbol === symbol + '-EQ')
   );
-  // Prefer an entry with no options-specific fields (the spot index line),
-  // not a derivative contract that happens to share the name.
   const spot = candidates.find(i => !i.expiry && !i.strike) || candidates[0];
   if (spot) return spot.token;
   console.error(`Could not resolve index token for ${symbol} on ${cfg.indexExch} — falling back`);
   return cfg.fallbackIndexToken;
 }
 
-// ── GET NEAREST EXPIRY FOR SYMBOL ─────────────────────────────
-function getNearestExpiry(allInstruments, symbol, cfg) {
-  const now = Date.now();
-  const expiries = [...new Set(
+// ── RESOLVE WHICH EXPIRY TO USE ───────────────────────────────
+// BUG FIX (root cause of "rates are from next week's expiry"): this
+// used to always grab whichever upcoming expiry was soonest, with no
+// way to ask for a specific one — so the panel's date picker had zero
+// effect on which chain actually came back. Now the caller's requested
+// date (YYYY-MM-DD, from the extension's expiry picker) is matched
+// against Angel One's real available expiries for that symbol, and the
+// closest one is used. Falls back to nearest-upcoming only when no
+// date was requested at all.
+function resolveExpiryString(allInstruments, symbol, cfg, requestedDateStr) {
+  const available = [...new Set(
     allInstruments
       .filter(i => i.exch_seg === cfg.optionExch && i.name === symbol && i.instrumenttype === 'OPTIDX')
       .map(i => i.expiry)
-  )].filter(e => parseExpiry(e) >= now);
-  expiries.sort((a, b) => parseExpiry(a) - parseExpiry(b));
-  return expiries[0] || null;
+  )];
+  if (available.length === 0) return null;
+
+  if (!requestedDateStr) {
+    const now = Date.now();
+    const future = available.filter(e => parseExpiry(e) >= now).sort((a, b) => parseExpiry(a) - parseExpiry(b));
+    return future[0] || available.sort((a, b) => parseExpiry(a) - parseExpiry(b))[0];
+  }
+
+  const reqMs = new Date(requestedDateStr + 'T00:00:00').getTime();
+  if (isNaN(reqMs)) {
+    const now = Date.now();
+    const future = available.filter(e => parseExpiry(e) >= now).sort((a, b) => parseExpiry(a) - parseExpiry(b));
+    return future[0] || null;
+  }
+
+  // Closest available real expiry to the requested date (handles
+  // holiday-shifted expiries that don't land exactly where expected).
+  let best = null, bestDiff = Infinity;
+  available.forEach(e => {
+    const diff = Math.abs(parseExpiry(e) - reqMs);
+    if (diff < bestDiff) { bestDiff = diff; best = e; }
+  });
+  return best;
 }
 
-// ── GET ALL STRIKES FOR EXPIRY ────────────────────────────────
-// Returns full options chain for a given symbol and expiry
 function getAllStrikeTokens(allInstruments, symbol, expiry, cfg) {
   const opts = allInstruments.filter(i =>
     i.exch_seg       === cfg.optionExch &&
@@ -200,8 +208,6 @@ function getAllStrikeTokens(allInstruments, symbol, expiry, cfg) {
   return Object.values(strikeMap).sort((a, b) => a.strike - b.strike);
 }
 
-// ── MAX PAIN CALCULATION ──────────────────────────────────────
-// Uses full chain OI — much more accurate than 6-strike version
 function calcMaxPain(fullChain) {
   if (!fullChain || fullChain.length === 0) return 0;
   let minPain = Infinity;
@@ -223,9 +229,15 @@ function calcMaxPain(fullChain) {
 }
 
 // ── FETCH OPTIONS CHAIN ───────────────────────────────────────
-async function fetchOptionsChain(symbol) {
+async function fetchOptionsChain(symbol, requestedExpiry) {
   const now = Date.now();
-  if (cache[symbol] && now - cache[symbol].time < CACHE_TTL) return cache[symbol].data;
+  // BUG FIX: cache key now includes the requested expiry. Previously
+  // it was keyed only on symbol, so once ANY expiry had been fetched
+  // for a symbol, every request for that symbol — including one for
+  // a different expiry — was served the same cached (wrong-expiry)
+  // chain for up to CACHE_TTL.
+  const cacheKey = `${symbol}::${requestedExpiry || 'nearest'}`;
+  if (cache[cacheKey] && now - cache[cacheKey].time < CACHE_TTL) return cache[cacheKey].data;
 
   const ok = await ensureSession();
   if (!ok) throw new Error('Authentication failed');
@@ -233,7 +245,6 @@ async function fetchOptionsChain(symbol) {
   const cfg  = getSymbolConfig(symbol);
   const allInstruments = await getInstruments();
 
-  // Step 1 — Get underlying price (correct exchange + resolved token)
   const indexToken = getIndexToken(allInstruments, symbol, cfg);
   let underlying    = 0;
   let underlyingOk   = false;
@@ -252,24 +263,19 @@ async function fetchOptionsChain(symbol) {
       console.error('LTP error:', err.message);
     }
   }
-  // BUG FIX: no more silent hardcoded fallback (old code used 54000 for
-  // every symbol, which isn't even close to NIFTY's or SENSEX's scale).
-  // If the underlying can't be fetched, fail loudly instead of quietly
-  // returning a chain built around a nonsense strike.
   if (!underlyingOk) throw new Error(`Could not fetch live underlying price for ${symbol}`);
 
   const step      = cfg.strikeStep;
   const atmStrike = Math.round(underlying / step) * step;
 
-  // Step 2 — Get nearest expiry + ALL strikes for that expiry
-  const nearestExpiry  = getNearestExpiry(allInstruments, symbol, cfg);
-  console.log(`${symbol} nearest expiry: ${nearestExpiry}`);
+  // Step 2 — Resolve which expiry to actually use, honoring what the
+  // client selected in the panel instead of always picking nearest.
+  const chainExpiry = resolveExpiryString(allInstruments, symbol, cfg, requestedExpiry);
+  console.log(`${symbol} requested expiry: ${requestedExpiry || '(none — nearest)'}  → resolved to: ${chainExpiry}`);
 
-  const allStrikeTokens = getAllStrikeTokens(allInstruments, symbol, nearestExpiry, cfg);
+  const allStrikeTokens = getAllStrikeTokens(allInstruments, symbol, chainExpiry, cfg);
   console.log(`${symbol} total strikes for max pain: ${allStrikeTokens.length}`);
 
-  // Step 3 — Fetch OI for ALL strikes (for accurate max pain)
-  // Also fetch full quotes for the 6 display strikes
   const displayStrikes = [-2, -1, 0, 1, 2, 3].map(i => atmStrike + i * step);
   const displayTokenMap = {};
   const displayNFOTokens = [];
@@ -282,7 +288,6 @@ async function fetchOptionsChain(symbol) {
     }
   });
 
-  // For max pain — get OI for ALL strikes (batch in groups of 50)
   const allTokens = [];
   const allTokenMap = {};
   allStrikeTokens.forEach(s => {
@@ -290,10 +295,6 @@ async function fetchOptionsChain(symbol) {
     if (s.peToken) { allTokens.push(s.peToken); allTokenMap[s.peToken] = { strike: s.strike, type: 'PE' }; }
   });
 
-  // BUG FIX: Angel One's 'LTP' quote mode does NOT return openInterest —
-  // only 'FULL' (or 'OHLC') does. The old code requested 'LTP' here and
-  // then read q.openInterest anyway, so oi was always 0 and Max Pain was
-  // being computed off an empty chain the whole time. Switched to 'FULL'.
   const fullChainOI = {};
   const batchSize = 50;
   for (let i = 0; i < allTokens.length; i += batchSize) {
@@ -321,11 +322,9 @@ async function fetchOptionsChain(symbol) {
   const fullChainArray = Object.values(fullChainOI);
   console.log(`Got OI for ${fullChainArray.length} strikes`);
 
-  // Calculate Max Pain from full chain
   const maxPain = calcMaxPain(fullChainArray);
   console.log(`${symbol} Max Pain: ${maxPain}`);
 
-  // Step 4 — Get FULL quotes for the 6 display strikes
   const strikeData = {};
   displayStrikes.forEach(s => {
     strikeData[s] = {
@@ -361,13 +360,14 @@ async function fetchOptionsChain(symbol) {
 
   const result = {
     symbol, underlying, atmStrike, maxPain,
-    expiry: nearestExpiry,
+    expiry: chainExpiry,
+    requestedExpiry: requestedExpiry || null,
     totalStrikesUsed: fullChainArray.length,
     strikes: displayStrikes.map(s => strikeData[s]),
     demo: false, timestamp: now,
   };
 
-  cache[symbol] = { data: result, time: now };
+  cache[cacheKey] = { data: result, time: now };
   return result;
 }
 
@@ -379,8 +379,9 @@ app.get('/health', (req, res) => {
 app.get('/options', async (req, res) => {
   let symbol = (req.query.symbol || 'NIFTY').toUpperCase();
   if (!ALLOWED_SYMBOLS.includes(symbol)) symbol = 'NIFTY'; // scope: NIFTY + SENSEX only
+  const expiry = req.query.expiry || null; // YYYY-MM-DD from the extension's picker
   try {
-    const data = await fetchOptionsChain(symbol);
+    const data = await fetchOptionsChain(symbol, expiry);
     res.json(data);
   } catch (err) {
     console.error('Options error:', err.message);
@@ -409,7 +410,7 @@ app.get('/instruments', async (req, res) => {
 
 // ── START ─────────────────────────────────────────────────────
 app.listen(PORT, async () => {
-  console.log(`TradingBot Proxy v3 running on port ${PORT}`);
+  console.log(`TradingBot Proxy v4 running on port ${PORT}`);
   await login();
   await getInstruments();
 });
